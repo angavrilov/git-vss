@@ -20,6 +20,8 @@ use POSIX qw(mktime strftime);
 use Win32::OLE;
 use Win32::OLE::Const 'Microsoft SourceSafe';
 
+use IO::Pipe;
+use IPC::Open2;
 
 our $dbh;
 our ($opt_init, $opt_import, $opt_connect, $git_tree, $opt_newhead, $opt_nomaps);
@@ -102,7 +104,14 @@ $work_dir =~ s/[\\\/]\.git$//;
 my $git_path = `git --exec-path`;
 chomp $git_path;
 $git_path =~ s/\//\\/g;
-$ENV{PATH} = $ENV{PATH} . ';' . $git_path;
+
+$ENV{PATH} .= ';' . $git_path;
+
+my $win_path = $ENV{COMSPEC};
+if ($win_path) {
+    $win_path =~ s/[\/\\][^\/\\]+$//;
+    $ENV{PATH} .= ';' . $win_path;
+}
 
 my $checkout_file = $git_dir.'/vss-checkouts';
 my $squash_msg_file = $git_dir.'/vss-message';
@@ -540,6 +549,25 @@ sub add_file_path($;$) {
     return $canonical_files{$lnew_path} = $npath;
 }
 
+sub force_file_names($$$) {
+    my ($dir, $oldpath, $newpath) = @_;
+    
+    my @oldlist = split /\//, $oldpath;
+    my @newlist = split /\//, $newpath;
+    
+    die "Invalid path pair: $oldpath -> $newpath\n"
+        unless @oldlist == @newlist && length($oldpath) == length($newpath);
+    
+    while (@oldlist) {
+        rename $dir.'/'.$oldlist[0], $dir.'/'.$newlist[0]
+            unless $oldlist[0] eq $newlist[0];
+            
+        $dir .= '/'.$newlist[0];
+        shift @oldlist;
+        shift @newlist;
+    }
+}
+
 sub sanitize_adds() {
     open_file_names();
     
@@ -561,7 +589,8 @@ sub sanitize_adds() {
             ($? == 0) or die "Index update failed\n";
             
             system 'git-update-index', '--force-remove', $name;
-            rename $work_dir.'/'.$name, $work_dir.'/'.$path;
+            
+            force_file_names $work_dir, $name, $path;
         }
     }
 }
@@ -688,6 +717,30 @@ sub exec_action($\%\%\%%) {
     return 1;
 }
 
+sub run_commit_tree($$@) {
+    my ($comment, $tree, @parents) = @_;
+    
+    my $name = tmpnam();
+    open FH, '>', $name;
+    print FH $comment;
+    close FH;
+    
+    my $parents = join('', map { ' -p '.$_; } @parents);
+    my $cmd = "git-commit-tree $tree $parents < \"$name\"";
+
+    #print "$_ => $ENV{$_}\n" for keys %ENV;
+    #print "$cmd\n";
+    
+    my $rv = `$cmd`;
+    unlink $name;
+    die "Could not run git-commit-tree\n" if $?;
+    
+    chomp $rv;
+    die "Invalid result of git-commit-tree: $rv\n" unless length($rv) == 40;
+    
+    return $rv;
+}
+
 sub make_commit($\@) {
     my ($old_head, $ractions) = @_;
 
@@ -766,17 +819,9 @@ sub make_commit($\@) {
     local $ENV{GIT_COMMITTER_DATE} = strftime("+0000 %Y-%m-%d %H:%M:%S",gmtime($time));
 
     $comment ||= '--none--';
-
-    my ($fh, $name) = tmpnam();
-    print $fh $comment;
-    close $fh;
-
-    my $sha = `git-commit-tree $tree_sha -p $old_head < \"$name\"`;
-    unlink $name;
-
-    chomp $sha;
-    die "Failed to commit: $sha" unless length($tree_sha) == 40;
-
+    
+    my $sha = run_commit_tree $comment, $tree_sha, $old_head;
+    
     # Log the actions into the db for future use
     $dbh->prepare(
         'INSERT OR REPLACE INTO known_commits '.
@@ -943,17 +988,10 @@ sub create_initial_branch {
     chomp $tree_sha;
     die "Failed to write tree: $tree_sha" unless length($tree_sha) == 40;
 
-    my ($cf, $name) = tmpnam();
-    print $cf "Initializing branch $branch_name\n";
-    close $cf;
+    my $sha = run_commit_tree "Initializing branch $branch_name\n", $tree_sha;
 
-    my $sha = `git-commit-tree $tree_sha < \"$name\"`;
-    unlink $name;
     unlink $ENV{GIT_INDEX_FILE};
-
-    chomp $sha;
-    die "Failed to commit: $sha" unless length($tree_sha) == 40;
-
+    
     $dbh->prepare(
         'INSERT OR REPLACE INTO known_commits '.
         '(commit_id, branch_name, parent_id, is_imported) '.
@@ -1566,7 +1604,9 @@ sub exec_checkin(\@\@\@$$) {
 
         my $nver = get_last_version($parent)->{VersionNumber};
 
-        die "File not added: $parent->{Spec}:$fname; $nver $cver" unless $nver > $cver;
+        unless ($nver > $cver) {
+            print STDERR "File not added: $parent->{Spec}:$fname; $nver $cver\n";
+        }
 
         if ($spec->[1]) {
             push @pin_shares, [ $name, $spec->[1][0], $spec->[1][1], $fitem, get_last_version($fitem)->{VersionNumber} ];
@@ -1577,7 +1617,8 @@ sub exec_checkin(\@\@\@$$) {
             my $pname = $name;
             $pname =~ s/\/[^\/]*$//;
 
-            $ins_stmt->execute($parent->{Physical}, $nver, 'Added', $pname);
+            $ins_stmt->execute($parent->{Physical}, $nver, 'Added', $pname) 
+                unless $nver <= $cver;
         }
     }
 
@@ -1698,8 +1739,6 @@ sub checkout_delta($$;$) {
         my ($mode, $name) = split /\t/, $row;
 
         if ($mode eq 'M') {
-            check_out_file $name, $master_map;
-        } elsif ($mode eq 'D') {
             check_out_file $name, $master_map;
         } elsif ($mode eq 'A') {
             check_out_add $name, $master_map;

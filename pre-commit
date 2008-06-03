@@ -1,0 +1,12 @@
+#!/bin/sh
+#
+# A hook script to force uniform filename case, in order to work
+# around git bugs on case-insensitive filesystems.
+#
+
+if git-rev-parse --verify HEAD &>/dev/null
+then
+    if ! git-diff-index --quiet --diff-filter=A HEAD &>/dev/null; then
+        git-vss --sanitize-adds
+    fi
+fi
