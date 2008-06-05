@@ -268,6 +268,8 @@ sub scan_log($$;$$) {
     }
     $processed += length($active_proc);
 
+    close FH;
+    
     return wantarray ? ($processed, $last_pos, $last_proc, \@actions) : $processed;
 }
 
@@ -1296,14 +1298,19 @@ sub check_conflicting_checkout($) {
                 ' since '.$cout->{Date}->Date('yyyy-MM-dd');
         }
 
-        die "File is already checked out to ".join(', ', @info).": $item->{Spec}\n";
+        die "File is already checked out to ".join(', ', @info).":\n  $item->{Spec}\n";
     }
 }
 
 sub get_last_version($) {
     my ($item) = @_;
     
-    return Win32::OLE::Enum->new($item->Versions())->Next();
+    my $enum = Win32::OLE::Enum->new($item->Versions());
+    while (my $ver = $enum->Next()) {
+        return $ver unless $ver->{Action} =~ /^Label/;
+    }
+    
+    return undef;
 }
 
 sub check_pinned_to_last($;$) {
@@ -1342,7 +1349,7 @@ QUERY
             }
 
             die "File is pinned to version $item->{VersionNumber}, ".
-                "while the latest is $top_ver: $item->{Spec}\n".
+                "while the latest is $top_ver:\n  $item->{Spec}\n".
                 join("\n", @entries)."\n";
         }
     }
@@ -1372,18 +1379,19 @@ sub get_checkin_spec($$) {
 
     my $links = Win32::OLE::Enum->new($item->{Links});
     while (defined (my $link = $links->Next())) {
+        next if $link->{Deleted};
         push @pinned, $link if $link->{IsPinned};
         push @unpinned, $link if !$link->{IsPinned};
     }
 
     (@unpinned > 0) or
-        die "File has no unpinned shares: ".
-            join(', ', map { $_->{Spec} } @pinned).
+        die "File has no unpinned shares:\n  ".
+            join("\n  ", map { $_->{Spec} } @pinned).
             "\n";
 
     (@unpinned < 2) or
-        die "File has multiple unpinned shares: ".
-            join(', ', map { $_->{Spec} } @unpinned).
+        die "File has multiple unpinned shares:\n  ".
+            join("\n  ", map { $_->{Spec} } @unpinned).
             "\n";
 
     check_within_mapping $unpinned[0]{Spec}, $mapping
@@ -1424,6 +1432,27 @@ sub spawn_project_tree($@) {
     return $root;
 }
 
+sub get_parent($) {
+    my $item = shift;
+                
+    my $parent = $item->{Parent};
+    
+    unless ($parent) {
+        $item->{Spec} =~ /^(.*)\/([^\/]+)/
+            or die "get_parent: invalid path $item->{Spec}\n";
+        my ($pp, $cn) = ($1, $2);
+            
+        $parent = $vss->VSSItem($pp)
+            or die "get_parent: project $pp not found\n";
+        
+        my $child = $parent->Child($cn);
+        $child && $child->{Physical} eq $item->{Physical}
+            or die "get_parent: child $cn of $pp not found or invalid.\n";
+    }
+    
+    return $parent;
+}
+
 my %checkouts;
 my %checkout_adds;
 my $checked_out_now = 0;
@@ -1449,6 +1478,8 @@ sub check_out_file($$) {
         my $phys_path = $work_dir.'/'.$path;
         $phys_path =~ s/\//\\/g;
 
+        print STDERR "Checking out $spec->[0]{Spec}\n";
+        
         $checked_out_now++;
         $spec->[0]->Checkout("", $phys_path, VSSFLAG_FORCEDIRNO | VSSFLAG_GETNO);
 
@@ -1467,7 +1498,7 @@ sub check_out_add($$) {
 
     my ($root, @adds) = find_add_root $path, -mappings => $master_map;
     die "File exists in the master branch, cannot add: $path\n" unless @adds;
-
+   
     my $share_spec;
 
     if ($master_map) {
@@ -1477,7 +1508,9 @@ sub check_out_add($$) {
         $share_spec = [ $root2, \@adds2 ];
     }
 
-    print CHECKOUT_LOG $branch_name,"\t",join('/', $root->{Spec}, @adds),"\n";
+    my $add_spec = join('/', $root->{Spec}, @adds);
+    print STDERR "Will add $add_spec\n";
+    print CHECKOUT_LOG $branch_name,"\t",$add_spec,"\n";
 
     $checkout_adds{$path} = [ [ $root, \@adds ], $share_spec ];
 }
@@ -1490,8 +1523,9 @@ sub exec_repin(\@\@\@;$) {
 
         next if $item->{Deleted};
 
-        my $parent = $item->{Parent};
-
+        print STDERR "Deleting $item->{Spec}\n";
+        
+        my $parent = get_parent $item;
         my $buddy = $parent->Child($item->{Name}, 1);
         $buddy->Destroy() if $buddy;
 
@@ -1511,6 +1545,8 @@ sub exec_repin(\@\@\@;$) {
         my $fname = pop @$adds;
         $parent = spawn_project_tree $parent, @$adds;
 
+        print STDERR "Sharing to $parent->{Spec}/$fname\n";
+        
         my $fver = $fitem->Version(1);
         $parent->Share($fver, "", VSSFLAG_GETNO);
 
@@ -1532,7 +1568,10 @@ sub exec_repin(\@\@\@;$) {
 
         next if $version <= $item->{VersionNumber};
 
-        my $parent = $item->{Parent};
+        print STDERR "Repinning $item->{Spec} to $version\n";
+        
+        my $parent = get_parent $item;
+        
         my $ver0 = $item->Version(0);
         my $verT = $item->Version($version);
 
@@ -1562,9 +1601,11 @@ sub exec_checkin(\@\@\@$$) {
     for my $delspec (@$rdels) {
         my ($name, $spec) = @$delspec;
 
-        my $parent = $spec->[0]{Parent};
+        my $parent = get_parent $spec->[0];
 
         unless ($spec->[0]{Deleted}) {
+            print STDERR "Deleting $spec->[0]{Spec}\n";
+        
             my $buddy = $parent->Child($spec->[0]{Name}, 1);
             $buddy->Destroy() if $buddy;
 
@@ -1590,6 +1631,8 @@ sub exec_checkin(\@\@\@$$) {
         my $fname = pop @$adds;
         $parent = spawn_project_tree $parent, @$adds;
 
+        print STDERR "Adding $parent->{Spec}/$fname\n";
+        
         my $tmp = $checkin_tmpdir."\\".$fname;
         system "git-cat-file blob $blob > \"$tmp\"";
         ($? == 0 && -f $tmp) or die "Could not extract data";
@@ -1605,7 +1648,7 @@ sub exec_checkin(\@\@\@$$) {
         my $nver = get_last_version($parent)->{VersionNumber};
 
         unless ($nver > $cver) {
-            print STDERR "File not added: $parent->{Spec}:$fname; $nver $cver\n";
+            print STDERR "  File not added: $nver <= $cver\n";
         }
 
         if ($spec->[1]) {
@@ -1625,13 +1668,18 @@ sub exec_checkin(\@\@\@$$) {
     for my $checkin (@$rcheckins) {
         my ($name, $cout, $blob) = @$checkin;
 
+        print STDERR "Checking in $cout->[0]{Spec}\n";
+        
         my $tmp = $checkin_tmpdir."\\".$blob;
         system "git-cat-file blob $blob > \"$tmp\"";
         ($? == 0 && -f $tmp) or die "Could not extract data";
 
         my $cver = get_last_version($cout->[0])->{VersionNumber};
 
-        $cout->[0]->Checkin($msg, $tmp, VSSFLAG_FORCEDIRNO | VSSFLAG_KEEPYES);
+        $cout->[0]->Checkin($msg, $tmp, 
+                VSSFLAG_FORCEDIRNO | VSSFLAG_DELNOREPLACE |
+                VSSFLAG_USERRONO | VSSFLAG_KEEPYES |
+                VSSFLAG_GETNO);
         unlink $tmp;
 
         my $nver = get_last_version($cout->[0])->{VersionNumber};
@@ -1643,7 +1691,7 @@ sub exec_checkin(\@\@\@$$) {
                 $ins_stmt->execute($cout->[0]{Physical}, $nver, 'Checked', $name);
             }
         } else {
-            print STDERR "File unchanged on check-in: $cout->[0]{Spec}\n";
+            print STDERR "  File unchanged on check-in.\n";
         }
     }
 
@@ -1702,8 +1750,14 @@ QUERY
 
                 my ($root, @adds) = find_add_root($fpath);
 
-                @adds or die "Cannot add: file $fpath already exists\n";
+                unless (@adds) {
+                    $root->{Physical} eq $fitem->{Physical}
+                        or die "Cannot add: file $fpath already exists\n";
 
+                    print STDERR "File $root->{Spec} already added\n";
+                    next;
+                }
+                
                 push @sharelist, [ $fpath, $root, \@adds, $fitem ];
             } else {
                 my ($item) = find_items_by_path $fpath, -force_one => 1;
@@ -1738,12 +1792,19 @@ sub checkout_delta($$;$) {
     for my $row (split /\n/, $rv) {
         my ($mode, $name) = split /\t/, $row;
 
-        if ($mode eq 'M') {
-            check_out_file $name, $master_map;
-        } elsif ($mode eq 'A') {
-            check_out_add $name, $master_map;
-        } else {
-            die "Unsupported change in diff $prev $cur: '$mode'\n"
+        eval {
+            if ($mode eq 'M') {
+                check_out_file $name, $master_map;
+            } elsif ($mode eq 'A') {
+                check_out_add $name, $master_map;
+            } else {
+                die "Unsupported change in diff $prev $cur: '$mode'\n"
+            }
+        };
+        
+        if ($@) {
+            die $@ if $opt_commit;
+            print STDERR $@;
         }
     }
 }
@@ -1888,6 +1949,8 @@ QUERY
     }
     close CHECKOUT_LOG;
 
+    print STDERR "Undoing all checkouts.\n";
+    
     local $vss_path;
     for $vss_path (keys %cout_set) {
         open_vss_link();
@@ -1968,7 +2031,7 @@ sub checkin_changes($) {
             $comment = <MSG_FILE>;
             close MSG_FILE;
         } else {
-            my $comment = $opt_squash."\n".$checkin_comment;
+            $comment = $opt_squash."\n".$checkin_comment;
 
             open MSG_FILE, '>', $squash_msg_file;
             print MSG_FILE $comment;
