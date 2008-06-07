@@ -32,15 +32,27 @@ our ($opt_rebase, $opt_nofetch, $opt_repin, $opt_undo_checkouts,
 
 sub usage() {
     print STDERR <<END;
-Usage: git-vss [-h|--help] [--root=GIT_repository] 
-       [--new-head] [--checkout] [--squash=title] [branchname]
-       --rebase branchname
-       --repin  branchname commit commit...
-       --init [--no-mappings] [--no-fetch] branchname vss_repo log_path log_offset < mappings
-       --import=path ... branchname vss_repo log_path log_offset < mappings
+Usage: git-vss [-h|--help] [--root=GIT_repository] parameters...
+
+    Update Git from VSS:
+       [--new-head] [--checkout] [--rebase] branchname
+    
+    Commit changes from Git into VSS:
+       --commit [--squash=title[:]] branchname
+    
+    Undo previous checkouts:
+       --undo-checkouts [branchname]
+       
+    Repin commits to the specified branch:
+       --repin branchname commit commit...
+
+    Initialize repository:
        --connect base_path
+       (--init|--import=path) [--no-mappings] [--no-fetch]
+           branchname vss_repo log_path log_offset < mappings
        (--load|--dump) [--authors=file] [--filenames=file]
-       --undo-checkouts
+
+    Canonify newly-added file names in the index:
        --sanitize-adds
 END
     exit(1);
@@ -1943,7 +1955,8 @@ QUERY
     close CHECKOUT_LOG;
 }
 
-sub undo_all_checkouts() {
+sub undo_all_checkouts(;$) {
+    my ($branch_filter) = @_;
     my %vss_paths;
 
     $vss_paths{$_->[0]} = $_->[1]
@@ -1953,16 +1966,31 @@ QUERY
 
     my %cout_set;
 
+    my $log2_file = $checkout_file.'.new';
+    my ($log2);
+    unlink $log2_file;
+
     open CHECKOUT_LOG, $checkout_file or return;
     while (<CHECKOUT_LOG>) {
         chomp;
         my ($branch, $file) = split /\t/, $_;
 
+        if ($branch_filter && $branch ne $branch_filter) {
+            open $log2, '>', $log2_file
+                unless $log2;
+
+            print $log2 "$_\n";
+            next;
+        }
+        
         $cout_set{$vss_paths{$branch}}{$file}++;
     }
     close CHECKOUT_LOG;
 
-    print STDERR "Undoing all checkouts.\n";
+    print STDERR 
+        "Undoing all checkouts", 
+        ($branch_filter ? " from $branch_filter" : ''),
+        ".\n";
     
     local $vss_path;
     for $vss_path (keys %cout_set) {
@@ -1981,6 +2009,10 @@ QUERY
     }
 
     unlink $checkout_file;
+    if ($log2) {
+        close $log2;
+        rename $log2_file, $checkout_file;
+    }
 }
 
 ###########################################################
@@ -2044,7 +2076,9 @@ sub checkin_changes($) {
             $comment = <MSG_FILE>;
             close MSG_FILE;
         } else {
-            $comment = $opt_squash."\n".$checkin_comment;
+            $comment = $opt_squash;
+            $comment .= "\n\n".$checkin_comment
+                if $comment =~ /:$/;
 
             open MSG_FILE, '>', $squash_msg_file;
             print MSG_FILE $comment;
@@ -2149,7 +2183,7 @@ sub update_branch_commits(%) {
     if ($opt_commit) {
         eval {
             checkin_changes(0) unless $pre_commit;
-            undo_all_checkouts();
+            undo_all_checkouts($branch_name);
         };
         $commit_error = $@;
 
@@ -2225,7 +2259,7 @@ QUERY
     ($? == 0) or die "Could not fetch branches.\n";
     exit 0;
 } elsif ($opt_undo_checkouts) {
-    undo_all_checkouts();
+    undo_all_checkouts($ARGV[0]);
     exit 0;
 }
 
