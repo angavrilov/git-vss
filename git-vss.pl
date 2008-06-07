@@ -1305,7 +1305,10 @@ sub check_conflicting_checkout($) {
 sub get_last_version($) {
     my ($item) = @_;
     
-    my $enum = Win32::OLE::Enum->new($item->Versions());
+    my $enum = Win32::OLE::Enum->new(
+        $item->Versions(VSSFLAG_HISTIGNOREFILES)
+        );
+
     while (my $ver = $enum->Next()) {
         return $ver unless $ver->{Action} =~ /^Label/;
     }
@@ -1545,14 +1548,21 @@ sub exec_repin(\@\@\@;$) {
         my $fname = pop @$adds;
         $parent = spawn_project_tree $parent, @$adds;
 
-        print STDERR "Sharing to $parent->{Spec}/$fname\n";
+        my $new_ver = defined $make_cout ? $make_cout : 1;
+        print STDERR "Sharing to $parent->{Spec}/$fname at $new_ver\n";
         
-        my $fver = $fitem->Version(1);
+        my $fver = $fitem->Version($new_ver);
         $parent->Share($fver, "", VSSFLAG_GETNO);
 
-        if ($make_cout) {
+        if (defined $make_cout) {
+            my $chld = $parent->Child($fname);
+            
+            # Don't remove - if we don't query VersionNumber at this point, weird things happen
+            print STDERR " - shared at version $chld->{VersionNumber}\n"
+                unless $chld->{VersionNumber} == $new_ver;
+        
             delete $checkout_adds{$name};
-            $checkouts{$name} = [ $fitem, $parent->Child($fname) ];
+            $checkouts{$name} = [ $fitem, $chld ];
         }
 
         if ($ins_stmt) {
@@ -1566,7 +1576,10 @@ sub exec_repin(\@\@\@;$) {
     for my $repin (@$rpinlist) {
         my ($name, $item, $version) = @$repin;
 
-        next if $version <= $item->{VersionNumber};
+        if ($version <= $item->{VersionNumber}) {
+            print STDERR "Not repinning $item->{Spec} to $version - already $item->{VersionNumber}\n";
+            next;
+        }
 
         print STDERR "Repinning $item->{Spec} to $version\n";
         
@@ -2099,6 +2112,7 @@ sub checkin_changes($) {
                     or die "Nonlinear commit chain '$crow'";
 
                 checkin_delta $id;
+                sleep 2;
             }
         }
     }
