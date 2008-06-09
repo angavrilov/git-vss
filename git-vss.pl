@@ -188,6 +188,7 @@ sub scan_log($$;$$) {
                     path => $path,
                     version => $ver,
                     user => $user,
+                    alterations => [],
                 };
 
                 if ($cmd =~ /^(.+) created$/) {
@@ -318,6 +319,8 @@ sub find_git_path($) {
 sub read_log_tasks($$) {
     my ($processed, $file) = @_;
 
+    my @actions;
+
     my $handler = sub {
         my ($entry) = @_;
 
@@ -332,13 +335,19 @@ sub read_log_tasks($$) {
         defined ($entry->{git_path} = find_git_path $entry->{path})
             or return 0;
 
+        if ($entry->{command} =~ /Renamed|Deleted|Recovered/) {
+            print STDERR "WARNING: $entry->{command} $entry->{path}/$entry->{name}\n";
+            push @{$_->{alterations}}, $entry for @actions;
+        }
+        
         # These commands change naming or versions, so bail out immediately
         die "Unsupported command: $entry->{path} $entry->{command} $entry->{name}\n"
-            if $entry->{command} =~ /Moved|Renamed|Branched|Restored/;
+            if $entry->{command} =~ /Moved|Branched|Restored/;
 
         # Ignore no-op actions
         return 0 if $entry->{command} =~ /Labeled|Archived|Created/;
 
+        push @actions, $entry;
         return 1;
     };
 
@@ -382,11 +391,56 @@ sub get_last_before($$) {
     return undef;
 }
 
+sub get_last_by_text($$) {
+    my ($item, $action_text) = @_;
+
+    return undef unless $item;
+
+    my $vset = $item->Versions(VSSFLAG_HISTIGNOREFILES);
+    my $enum = Win32::OLE::Enum->new($vset);
+    while (defined (my $ver = $enum->Next())) {
+        next unless $ver->{Action} eq $action_text;
+        return $ver;
+    }
+
+    return undef;
+}
+
 sub get_version_at($$) {
     my ($item, $idx) = @_;
 
     return undef unless $item;
     return $item->Versions(VSSFLAG_HISTIGNOREFILES)->Item($idx);
+}
+
+sub alter_path($$;$) {
+    my ($alt_list, $path, $name) = @_;
+    
+    my $ret_name = defined $name;
+    my $isdel = 0;
+    
+    $path .= '/'.$name if $ret_name;
+    
+    for my $item (@$alt_list) {
+        next unless lc $path eq lc($item->{path}.'/'.$item->{name});
+
+        if ($item->{command} eq 'Renamed') {
+            $path = $item->{path}.'/'.$item->{new_name};
+        } elsif ($item->{command} eq 'Deleted') {
+            $isdel = 1;
+        } elsif ($item->{command} eq 'Recovered') {
+            $isdel = 0;
+        } else {
+            die "Invalid alteration: $item->{command}";
+        }
+    }
+    
+    if ($ret_name) {
+        $path =~ /\/([^\/]+)$/ or die "Invalid path $path";
+        return ($1, $isdel);
+    } else {
+        return ($path, $isdel);
+    }
 }
 
 my $action_lookup_stmt;
@@ -395,12 +449,31 @@ my $action_lookup_stmt;
 sub convert_action($) {
     my ($entry) = @_;
 
+    # Account for later renames
+    my ($act_path, $act_del) = alter_path $entry->{alterations}, $entry->{path};
+    
+    my $msg_path = $act_path eq $entry->{path} ? $entry->{path} : "$entry->{path} ($act_path)";
+    
     # Find the item, and extract the named version
-    my $vss_item = $vss->VSSItem('$'.$entry->{path})
-        or die "Cannot find item \$$entry->{path}";
+    my $vss_item = $vss->VSSItem('$'.$act_path, $act_del)
+        or die "Cannot find item \$$msg_path";
 
-    my $item_version = get_version_at $vss_item, $entry->{version}
-        or die "Cannot find version \$$entry->{path}:$entry->{version}\n";
+    my $item_version = get_version_at $vss_item, $entry->{version};
+
+    if ($entry->{command} eq 'Renamed') {
+        my $text = 'Renamed '.$entry->{name}.' to '.$entry->{new_name};
+
+        $item_version = get_last_by_text $vss_item, $text
+            unless $item_version && $item_version->{Action} eq $text;
+            
+        print STDERR 
+            "VSS BUG: Rename logged as $entry->{version}, ".
+            "actually $item_version->{VersionNumber}\n"
+            if $item_version && 
+               $item_version->{VersionNumber} != $entry->{version};
+    }
+    
+    die "Cannot find version \$$msg_path:$entry->{version}\n" unless $item_version;
 
     # Verify the action - it must match the logged one
     my $item_action = $item_version->{Action};
@@ -458,10 +531,16 @@ sub convert_action($) {
     } elsif ($entry->{command} eq 'Checked') {
         print STDERR "edit $entry->{path}:$entry->{version}\n";
         return [ 'edit', $entry->{git_path}, $item_version, $entry ];
+    } elsif ($entry->{command} eq 'Renamed') {
+        print STDERR "rename $entry->{path}/$entry->{name} -> $entry->{new_name}\n";
+        return [ 'rename:'.$entry->{new_name}, $entry->{git_path}."/".$entry->{name},
+                            $item_version, $entry ];
     } else {
         my $subpath = $entry->{git_path}.'/'.$entry->{name};
-        my $file_item = $item_version->{VSSItem}->Child($entry->{name})
-            or die "$entry->{name} not found in $entry->{path}:$entry->{version}\n";
+        my ($act_name, $act_fdel) = alter_path $entry->{alterations}, $entry->{path}, $entry->{name};
+
+        my $file_item = $item_version->{VSSItem}->Child($act_name, $act_fdel)
+            or die "$act_name not found in $act_path:$entry->{version}\n";
 
         if ($entry->{command} eq 'Added') {
             print STDERR "add $subpath:1\n";
@@ -674,6 +753,25 @@ sub cache_file($$) {
     system 'git-update-index', '--add', '--cacheinfo', '0644', $sha, $path;
 }
 
+sub cache_rename_file($$) {
+    my ($old_path, $new_path) = @_;
+    
+    return if $old_path eq $new_path;
+
+    my $rv = `git-ls-files --stage -- \"$old_path\"`;
+    chomp $rv;
+    
+    ($? == 0 && $rv =~ /^(\d+) ([a-f0-9]+) \d+\t(.+)$/)
+        or die "Old file not found for rename: $old_path\n";
+        
+    my ($mode, $sha, $name) = ($1, $2, $3);
+    $name eq $old_path 
+        or die "Invalid ls-files result: $name instead of $old_path\n";
+        
+    system 'git-update-index', '--force-remove', $old_path;
+    system 'git-update-index', '--add', '--cacheinfo', $mode, $sha, $new_path;
+}
+
 sub exec_action($\%\%\%%) {
     my ($action, $delmap, $editmap, $cleanmap, %flags) = @_;
 
@@ -724,6 +822,28 @@ sub exec_action($\%\%\%%) {
 
         print STDERR "Adding $path\n";
         cache_file $action->[2], $path;
+    } elsif ($action->[0] =~ /^rename:(.+)$/) {
+        my $new_name = $1;
+        $action->[1] =~ /^(.*)\/([^\/]+)$/;
+        my ($dir, $old_name) = ($1, $2);
+        
+        $path = $current_files{lc $action->[1]} = add_file_path $action->[1] 
+            unless $path;
+            
+        my $new_path = add_file_path $dir.'/'.$new_name;
+        
+        return 0 if $editmap->{$path} || $delmap->{$path} ||
+                    $editmap->{$new_path} || $delmap->{$new_path};
+
+        $editmap->{$path}++;
+        $delmap->{$path}++;
+        $editmap->{$new_path}++;
+        
+        return 2 if $flags{-no_exec};
+        $cleanmap->{$path}++;
+        
+        print STDERR "Renaming $path to $new_path\n";
+        cache_rename_file $path, $new_path;
     } else {
         die "Invalid action '$action->[0]'";
     }
