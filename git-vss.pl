@@ -335,7 +335,7 @@ sub read_log_tasks($$) {
         defined ($entry->{git_path} = find_git_path $entry->{path})
             or return 0;
 
-        if ($entry->{command} =~ /Renamed|Deleted|Recovered/) {
+        if ($entry->{command} =~ /Renamed|Deleted|Recovered|Destroyed/) {
             print STDERR "WARNING: $entry->{command} $entry->{path}/$entry->{name}\n";
             push @{$_->{alterations}}, $entry for @actions;
         }
@@ -430,6 +430,9 @@ sub alter_path($$;$) {
             $isdel = 1;
         } elsif ($item->{command} eq 'Recovered') {
             $isdel = 0;
+        } elsif ($item->{command} eq 'Destroyed') {
+            $isdel = -1;
+            last;
         } else {
             die "Invalid alteration: $item->{command}";
         }
@@ -452,6 +455,11 @@ sub convert_action($) {
     # Account for later renames
     my ($act_path, $act_del) = alter_path $entry->{alterations}, $entry->{path};
     
+    if ($act_del < 0) {
+        print STDERR "Skipping $entry->{command} on $entry->{path} - object destroyed.\n";
+        return undef;
+    }
+    
     my $msg_path = $act_path eq $entry->{path} ? $entry->{path} : "$entry->{path} ($act_path)";
     
     # Find the item, and extract the named version
@@ -471,6 +479,11 @@ sub convert_action($) {
             "actually $item_version->{VersionNumber}\n"
             if $item_version && 
                $item_version->{VersionNumber} != $entry->{version};
+    } elsif ($entry->{command} eq 'Copied') {
+        $item_version = get_version_at $vss_item, $entry->{version}-1
+            unless $item_version && 
+                   $item_version->{Action} =~ /^Shared .*\/([^\/]+)$/ &&
+                   $1 eq $entry->{name};
     }
     
     die "Cannot find version \$$msg_path:$entry->{version}\n" unless $item_version;
@@ -489,6 +502,9 @@ sub convert_action($) {
     } elsif ($item_action =~ /^(\S+)/) {
         $item_command = $1;
     }
+    
+    $item_command = 'Copied' 
+        if $item_command eq 'Shared' && $entry->{command} eq 'Copied';
 
     die "Command mismatch: $item_action vs $entry->{command}\n"
         unless $item_command eq $entry->{command};
@@ -539,13 +555,18 @@ sub convert_action($) {
         my $subpath = $entry->{git_path}.'/'.$entry->{name};
         my ($act_name, $act_fdel) = alter_path $entry->{alterations}, $entry->{path}, $entry->{name};
 
+        if ($act_fdel < 0) {
+            print STDERR "Skipping $entry->{command} on $entry->{path}/$entry->{name} - object destroyed.\n";
+            return undef;
+        }
+
         my $file_item = $item_version->{VSSItem}->Child($act_name, $act_fdel)
             or die "$act_name not found in $act_path:$entry->{version}\n";
 
         if ($entry->{command} eq 'Added') {
             print STDERR "add $subpath:1\n";
             return [ 'add', $subpath, get_version_at($file_item, 1), $entry ];
-        } elsif ($entry->{command} =~ /Shared|Recovered/) {
+        } elsif ($entry->{command} =~ /Shared|Recovered|Copied/) {
             die "Sharing/recovering a folder" 
                 if $file_item->{Type} == VSSITEM_PROJECT;
         
