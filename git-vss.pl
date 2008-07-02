@@ -24,6 +24,8 @@ use IO::Pipe;
 use IPC::Open2;
 
 our $dbh;
+our $is_postgres = 0;
+
 our ($opt_init, $opt_import, $opt_connect, $git_tree, $opt_newhead, $opt_nomaps);
 our ($opt_dump, $opt_load, $authors_file, $filename_file);
 our ($opt_rebase, $opt_nofetch, $opt_repin, $opt_undo_checkouts,
@@ -513,7 +515,7 @@ sub convert_action($) {
     # Check if this action is known to have been done via git-vss
     $action_lookup_stmt = $dbh->prepare(
         'SELECT vss_action FROM known_actions '.
-        'WHERE vss_physid = ? AND vss_version = ? AND NOT is_imported'
+        'WHERE vss_physid = ? AND vss_version = ? AND is_imported = 0'
         )
         unless $action_lookup_stmt;
 
@@ -598,7 +600,9 @@ my $mark_dir_stmt;
 sub fetch_file_names() {
     return if $add_file_stmt;
 
-    $add_file_stmt = $dbh->prepare('INSERT OR IGNORE INTO file_names VALUES (?, ?, ?)');
+    $dbh->do('LOCK TABLE file_names IN ROW EXCLUSIVE MODE') if $is_postgres;
+    
+    $add_file_stmt = $dbh->prepare('INSERT INTO file_names VALUES (?, ?, ?)');
     $mark_dir_stmt = $dbh->prepare('UPDATE file_names SET is_folder = 1 WHERE key_name = ?');
     %canonical_dirs = ();
     %canonical_files = ();
@@ -617,9 +621,11 @@ QUERY
 
 sub open_file_names() {
     return if $add_file_stmt;
+    
+    $dbh->do('LOCK TABLE file_names IN ROW EXCLUSIVE MODE') if $is_postgres;
 
     $get_file_stmt = $dbh->prepare('SELECT canonical_name, is_folder FROM file_names WHERE key_name = ?');
-    $add_file_stmt = $dbh->prepare('INSERT OR IGNORE INTO file_names VALUES (?, ?, ?)');
+    $add_file_stmt = $dbh->prepare('INSERT INTO file_names VALUES (?, ?, ?)');
     $mark_dir_stmt = $dbh->prepare('UPDATE file_names SET is_folder = 1 WHERE key_name = ?');
     %canonical_dirs = ();
     %canonical_files = ();    
@@ -980,7 +986,7 @@ sub make_commit($\@) {
     
     # Log the actions into the db for future use
     $dbh->prepare(
-        'INSERT OR REPLACE INTO known_commits '.
+        'INSERT INTO known_commits '.
         '(commit_id, branch_name, parent_id, is_imported) '.
         'VALUES (?, ?, ?, 1)'
         )->execute(
@@ -988,11 +994,11 @@ sub make_commit($\@) {
         );
 
     my $ins_stmt = $dbh->prepare(
-        'INSERT OR REPLACE INTO known_actions '.
+        'INSERT INTO known_actions '.
         '(vss_physid, vss_version, vss_action, git_path, commit_id, is_imported) '.
         'VALUES (?, ?, ?, ?, ?, 1)'
         );
-
+        
     $ins_stmt->execute(@{$_->[3]{known_action_info}}[0..3], $sha)
         for @commit_actions;
 
@@ -1022,10 +1028,10 @@ sub set_local_head($) {
         system 'git-branch', '-f', $branch_name, $head;
         ($? == 0) or die "Could not set local branch.\n";
     } else {
-        my $fpath = $git_dir.'/refs/remotes/vss/'.$branch_name;
-        die "Local head does not exist: $fpath" unless -f $fpath;
+        my $fpath = $git_dir.'/refs/remotes/vss/';
+        die "Local ref directory does not exist: $fpath" unless -d $fpath;
         
-        open FH, '>:raw', $fpath;
+        open FH, '>:raw', $fpath.$branch_name;
         print FH "$head\n";
         close FH;
     }    
@@ -1149,7 +1155,7 @@ sub create_initial_branch {
     unlink $ENV{GIT_INDEX_FILE};
     
     $dbh->prepare(
-        'INSERT OR REPLACE INTO known_commits '.
+        'INSERT INTO known_commits '.
         '(commit_id, branch_name, parent_id, is_imported) '.
         'VALUES (?, ?, NULL, 0)'
         )->execute(
@@ -1260,7 +1266,7 @@ sub load_other_mappings($) {
 }
 
 sub import_mappings() {
-    my $ist = $dbh->prepare('INSERT OR REPLACE INTO vss_mappings VALUES (?, ?, ?)');
+    my $ist = $dbh->prepare('INSERT INTO vss_mappings VALUES (?, ?, ?)');
     
     my $fh = \*STDIN;
     
@@ -1269,6 +1275,9 @@ sub import_mappings() {
             or die "Cannot open $ARGV[0]\n";
         shift @ARGV;
     }
+    
+    $dbh->prepare('DELETE FROM vss_mappings WHERE branch_name = ?')
+        ->execute($branch_name);
     
     while (<$fh>) {
         chomp;
@@ -1308,7 +1317,10 @@ sub load_data() {
         open DUMP, $authors_file 
             or die "Cannot open $authors_file\n";
 
-        my $upd_stmt = $dbh->prepare('INSERT OR REPLACE INTO vss_users (vss_user, real_name, real_email) VALUES (?, ?, ?)');
+        $dbh->do('LOCK TABLE vss_users IN ROW EXCLUSIVE MODE') if $is_postgres;
+            
+        my $del_stmt = $dbh->prepare('DELETE FROM vss_users WHERE vss_user = ?');
+        my $upd_stmt = $dbh->prepare('INSERT INTO vss_users (vss_user, real_name, real_email) VALUES (?, ?, ?)');
 
         while (<DUMP>) {
             chomp;
@@ -1318,6 +1330,8 @@ sub load_data() {
                 or die "Invalid user file format: $_\n";
 
             my ($user, $name, $email) = ($1, $2, $3);
+            
+            $del_stmt->execute(lc $user);
             $upd_stmt->execute(lc $user, $name, $email);
         }
 
@@ -2178,9 +2192,12 @@ sub verify_current_head() {
 sub fetch_branch_info() {
     my $qname = $dbh->quote($branch_name);
 
+    my $upd_str = $is_postgres ? 'FOR UPDATE' : '';
+    
     ($vss_path, $log_path, $log_offset, $initial_head) = $dbh->selectrow_array(<<QUERY)
         SELECT repo_path, log_path, log_offset, current_head FROM vss_branches
         WHERE branch_name = $qname
+        $upd_str
 QUERY
         or die "Unknown VSS branch $branch_name\n";
 
@@ -2345,9 +2362,11 @@ sub update_branch_commits(%) {
 
     # Update the table
     if ($opt_init || $opt_import) {
+        $dbh->prepare('DELETE FROM vss_branches WHERE branch_name = ?')
+            ->execute($branch_name);
+
         $dbh->prepare(<<QUERY)
-            INSERT OR REPLACE 
-            INTO vss_branches (branch_name, repo_path, log_path, current_head, log_offset, checkin_branch)
+            INSERT INTO vss_branches (branch_name, repo_path, log_path, current_head, log_offset, checkin_branch)
             VALUES (?, ?, ?, ?, ?, ?)
 QUERY
             ->execute($branch_name, $vss_path, $user_log_path, $initial_head, $log_offset, $opt_master);
@@ -2385,17 +2404,36 @@ if ($opt_init || $opt_import || $opt_load || $opt_dump) {
     } 
 } elsif ($opt_connect) {
     $base_path = shift @ARGV;
-    die "Bad base repository path: $base_path\n" unless -f $base_path."/gitvss.sqlite";
+    die "Bad base repository path: $base_path\n" 
+        unless -f $base_path."/gitvss.sqlite"
+            || -f $base_path."/gitvss.pg_ini";
 
     system 'git-config', 'gitvss.basePath', $base_path;
 } else {
     $base_path = `git config --get gitvss.basePath`;
     chomp $base_path;
 
-    die "Cannot determine the base repository path\n" unless -f $base_path."/gitvss.sqlite";
+    die "Cannot determine the base repository path\n"
+        unless -f $base_path."/gitvss.sqlite"
+            || -f $base_path."/gitvss.pg_ini";
 }
 
-$dbh = DBI->connect("dbi:SQLite:dbname=$base_path/gitvss.sqlite","","", { RaiseError => 1 });
+if (-f $base_path."/gitvss.pg_ini") {
+    open INI, $base_path."/gitvss.pg_ini";
+    my ($params, @init_lines) = <INI>;
+    close INI;
+
+    chomp $params;
+    $is_postgres = 1;
+    
+    $dbh = DBI->connect("dbi:Pg:$params","","", { RaiseError => 1 })
+        or die "Could not connect to the database.\n";
+
+    $dbh->do($_) for grep /\S/, @init_lines;
+} else {
+    $dbh = DBI->connect("dbi:SQLite:dbname=$base_path/gitvss.sqlite","","", { RaiseError => 1 })
+        or die "Could not connect to the database.\n";
+}
 
 if ($opt_sanitize) {
     sanitize_adds();
@@ -2416,14 +2454,16 @@ QUERY
     exit 0;
 }
 
-$dbh->do('BEGIN IMMEDIATE TRANSACTION');
+$dbh->do($is_postgres ? 'BEGIN' : 'BEGIN IMMEDIATE TRANSACTION');
 
 if ($opt_load) {
     create_tables();
     load_data();
+    $dbh->disconnect;
     exit 0;
 } elsif ($opt_dump) {
     dump_data();
+    $dbh->disconnect;
     exit 0;
 }
 
@@ -2477,6 +2517,7 @@ update_branch_commits();
 
 # Done
 $dbh->do('COMMIT');
+$dbh->disconnect;
 
 # Rebase
 if ($opt_rebase && !$opt_commit) {
