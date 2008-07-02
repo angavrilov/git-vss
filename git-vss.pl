@@ -28,7 +28,7 @@ our ($opt_init, $opt_import, $opt_connect, $git_tree, $opt_newhead, $opt_nomaps)
 our ($opt_dump, $opt_load, $authors_file, $filename_file);
 our ($opt_rebase, $opt_nofetch, $opt_repin, $opt_undo_checkouts,
      $opt_checkout, $opt_squash, $opt_commit, $opt_master,
-     $opt_sanitize);
+     $opt_sanitize, $opt_mergetool);
 
 sub usage() {
     print STDERR <<END;
@@ -79,6 +79,7 @@ GetOptions(
     'squash=s'       => \$opt_squash,
     'master=s'       => \$opt_master,
     'sanitize-adds'  => \$opt_sanitize,
+    'mergetool=s'    => \$opt_mergetool,
  ) or usage();
 
 $opt_nofetch = 0 unless $opt_init || $opt_import;
@@ -372,7 +373,7 @@ sub get_timestamp($) {
     my $str = $date->Date('yyyy-MM-dd ').$date->Time('HH:mm:ss');
     $str =~ /(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/;
 
-    return mktime($6, $5, $4, $3, $2-1, $1-1900);
+    return mktime($6, $5, $4, $3, $2-1, $1-1900, 0, 0, -1);
 }
 
 sub get_last_before($$) {
@@ -2203,6 +2204,19 @@ sub is_unmerged() {
     return $umf =~ /\S/;
 }
 
+sub run_mergetool() {
+    if ($opt_mergetool && $opt_mergetool eq 'none') {
+        print "Merge conflicts and press enter:\n";
+        my $v = <STDIN>;
+    } elsif ($opt_mergetool) {
+        system $opt_mergetool;
+        ($? == 0) or die "Merge tool invocation failed\n";
+    } else {
+        system 'git', 'mergetool';
+        ($? == 0) or die "Merge tool invocation failed\n";
+    }
+}
+
 sub checkin_changes($) {
     my ($pre) = @_;
 
@@ -2234,8 +2248,7 @@ sub checkin_changes($) {
         die "Fatal merge failure.\n" if ($rc >= 2);
 
         if ($rc == 1) {
-            system 'git', 'mergetool';
-            ($? == 0) or die "Merge tool invocation failed\n";
+            run_mergetool;
 
             die "Unmerged files left\n" if is_unmerged;
 
@@ -2255,8 +2268,7 @@ sub checkin_changes($) {
 
             while ($? != 0) {
                 if (is_unmerged) {
-                    system 'git', 'mergetool';
-                    ($? == 0) or die "Merge tool invocation failed\n";
+                    run_mergetool;
 
                     die "Unmerged files left\n" if is_unmerged;
 
