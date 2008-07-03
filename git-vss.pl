@@ -23,6 +23,8 @@ use Win32::OLE::Const 'Microsoft SourceSafe';
 use IO::Pipe;
 use IPC::Open2;
 
+$| = 1;
+
 our $dbh;
 our $is_postgres = 0;
 
