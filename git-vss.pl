@@ -347,10 +347,10 @@ sub read_log_tasks($$) {
         
         # These commands change naming or versions, so bail out immediately
         die "Unsupported command: $entry->{path} $entry->{command} $entry->{name}\n"
-            if $entry->{command} =~ /Moved|Branched|Restored/;
+            if $entry->{command} =~ /Moved|Restored/;
 
         # Ignore no-op actions
-        return 0 if $entry->{command} =~ /Labeled|Archived|Created/;
+        return 0 if $entry->{command} =~ /Labeled|Archived|Branched|Created/;
 
         push @actions, $entry;
         return 1;
