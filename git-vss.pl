@@ -415,7 +415,24 @@ sub get_version_at($$) {
     my ($item, $idx) = @_;
 
     return undef unless $item;
-    return $item->Versions(VSSFLAG_HISTIGNOREFILES)->Item($idx);
+    my $vset = $item->Versions(VSSFLAG_HISTIGNOREFILES);
+    my $entry = $vset->Item($idx);
+	
+    if ($entry && $entry->{Action} =~ /^Label/) {
+        $entry = undef;
+
+        my $enum = Win32::OLE::Enum->new($vset);
+        while (defined (my $ver = $enum->Next())) {
+            next if $ver->{Action} =~ /^Label/;
+
+            last if $ver->{VersionNumber} < $idx;
+            next if $ver->{VersionNumber} > $idx;
+            $entry = $ver;
+            last;
+        }
+    }
+
+    return $entry;
 }
 
 sub alter_path($$;$) {
@@ -430,6 +447,7 @@ sub alter_path($$;$) {
         next unless lc $path eq lc($item->{path}.'/'.$item->{name});
 
         if ($item->{command} eq 'Renamed') {
+            next if $isdel;
             $path = $item->{path}.'/'.$item->{new_name};
         } elsif ($item->{command} eq 'Deleted') {
             $isdel = 1;
@@ -511,7 +529,7 @@ sub convert_action($) {
     $item_command = 'Copied' 
         if $item_command eq 'Shared' && $entry->{command} eq 'Copied';
 
-    die "Command mismatch: $item_action vs $entry->{command}\n"
+    die "Command mismatch: $item_action vs $entry->{command} at \$$msg_path:$entry->{version}\n"
         unless $item_command eq $entry->{command};
 
     # Check if this action is known to have been done via git-vss
@@ -565,8 +583,8 @@ sub convert_action($) {
             return undef;
         }
 
-        my $file_item = $item_version->{VSSItem}->Child($act_name, $act_fdel)
-            or die "$act_name not found in $act_path:$entry->{version}\n";
+        my $file_item = $item_version->{VSSItem}->Child($entry->{name}, 0)
+            or die "$entry->{name} not found in $act_path:$entry->{version}\n";
 
         if ($entry->{command} eq 'Added') {
             print STDERR "add $subpath:1\n";
@@ -791,8 +809,10 @@ sub cache_rename_file($$) {
     my $rv = `git-ls-files --stage -- \"$old_path\"`;
     chomp $rv;
     
-    ($? == 0 && $rv =~ /^(\d+) ([a-f0-9]+) \d+\t(.+)$/)
-        or die "Old file not found for rename: $old_path\n";
+    unless ($? == 0 && $rv =~ /^(\d+) ([a-f0-9]+) \d+\t(.+)$/) {
+        print STDERR " - old file not found for rename: $old_path\n";
+        return;
+    }
         
     my ($mode, $sha, $name) = ($1, $2, $3);
     $name eq $old_path 
@@ -995,12 +1015,19 @@ sub make_commit($\@) {
             $sha, $branch_name, $old_head
         );
 
+    my $del_stmt = $dbh->prepare(
+        'DELETE FROM known_actions WHERE vss_physid = ? AND vss_version = ?'
+        );
+		
     my $ins_stmt = $dbh->prepare(
         'INSERT INTO known_actions '.
         '(vss_physid, vss_version, vss_action, git_path, commit_id, is_imported) '.
         'VALUES (?, ?, ?, ?, ?, 1)'
         );
-        
+    
+    $del_stmt->execute(@{$_->[3]{known_action_info}}[0..1])
+        for grep { $_->[0] =~ /^rename:/; } @commit_actions;
+    
     $ins_stmt->execute(@{$_->[3]{known_action_info}}[0..3], $sha)
         for @commit_actions;
 
