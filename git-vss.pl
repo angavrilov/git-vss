@@ -340,7 +340,7 @@ sub read_log_tasks($$) {
         defined ($entry->{git_path} = find_git_path $entry->{path})
             or return 0;
 
-        if ($entry->{command} =~ /Renamed|Deleted|Recovered|Destroyed/) {
+        if ($entry->{command} =~ /Renamed|Deleted|Recovered|Destroyed|Purged/) {
             print STDERR "WARNING: $entry->{command} $entry->{path}/$entry->{name}\n";
             push @{$_->{alterations}}, $entry for @actions;
         }
@@ -350,7 +350,7 @@ sub read_log_tasks($$) {
             if $entry->{command} =~ /Moved|Restored/;
 
         # Ignore no-op actions
-        return 0 if $entry->{command} =~ /Labeled|Archived|Branched|Created/;
+        return 0 if $entry->{command} =~ /Labeled|Archived|Branched|Created|Purged/;
 
         push @actions, $entry;
         return 1;
@@ -454,6 +454,10 @@ sub alter_path($$;$) {
         } elsif ($item->{command} eq 'Recovered') {
             $isdel = 0;
         } elsif ($item->{command} eq 'Destroyed') {
+            $isdel = -1;
+            last;
+        } elsif ($item->{command} eq 'Purged') {
+            next unless $isdel;
             $isdel = -1;
             last;
         } else {
