@@ -1,0 +1,180 @@
+h2. Introduction
+
+This script implements bi-directional exchange of simple changes between Git and VSS. It can be used to aid a smooth transition to Git, or by individual users.
+
+h2. Basic operation
+
+The script depends on the logging feature of VSS, which is the only way to quickly find what changed without scanning the whole repository. Unfortunately, it is not very reliable even by VSS standards.
+
+h3. Initialization
+
+The first step is to ensure that logging is enabled in VSS, and then import the existing history of the VSS repository into Git. This operation can be done by first converting it to svn via "vss2svn":http://www.pumacode.org/projects/vss2svn and then using tools like @git svn@ or "svn2git":http://gitorious.org/svn2git/svn2git, by a direct conversion using "vss2git":http://code.google.com/p/vss2git, or by any other available means.
+
+The next step is to create a bare repository (subsequently referred to as the base repository) with the necessary branches, and initialize git-vss using the following command:
+
+<pre>
+git vss --init [--no-mappings] [--no-fetch] \
+     branchname vss_repo log_path log_offset < mappings.txt
+</pre>
+
+Here branchname specifies the Git branch, vss_repo is the path to the VSS repository, log_path names the VSS log file (use either absolute path, or relative to the VSS root), and log_offset specifies an offset where to start reading it. This offset should generally be the size of the file at the moment when the initial snapshot was taken.
+
+(It is also possible to initialize a branch by importing a check-out. To do this, use @--import=path@ instead of @--init@.)
+
+The base repository is expected to be located on a network share and used by all git-vss users that connect to the same VSS repository as a coordination point. The script maintains it as a mirror of the VSS tree, except that all commits submitted via git-vss are directly pushed there so that all meta-data is preserved intact.
+
+The mappings specify how paths in VSS map to paths within the Git branch, using the following format:
+
+<pre>
+# Comment
+/vss/path/one = /git/path
+/vss/path/two = /git
+/vss/path/two/junk = IGNORE
+...
+</pre>
+
+During processing the script selects rules based on the longest matching prefix.
+
+In order to create a working copy, clone the base repository and run the following command:
+
+<pre>
+git vss --connect <path-to-the-base-repo>
+</pre>
+
+h3. Authors and filenames
+
+It is possible to import a mapping of VSS logins to Git-style authors and e-mails, and a list of file names, by running this command in the base repository:
+
+<pre>
+git vss --load [--authors=file] [--filenames=file]
+</pre>
+
+The file name list is used to canonify the filename case across branches in order to work around some issues in past versions of Git regarding filename case on case-insensitive filesystems. This feature may be obsolete by now.
+
+h3. Retrieving changes from VSS
+
+In order to import changes from VSS to Git, use the following command in your working copy:
+
+<pre>
+git vss [--new-head] [--rebase] branchname
+</pre>
+
+The branch name must match one of the names originally used with the --init command. The rebase flag makes this command behave like @git svn rebase@ instead of @git svn fetch@.
+
+The new-head flag can be used to override the internal integrity check after manually fixing the branch in the base repository. This may be necessary if the script fails to handle some of the more complex operations in VSS.
+
+The script should work reliably with simple file changes, additions, and removals; file renames are tricky due to numerous bugs and misfeatures of VSS. Folder moves and archive restores don't work at all.
+
+h3. Committing changes to VSS
+
+Your changes can be uploaded to VSS by running the following command in the working copy:
+
+<pre>
+git vss --commit [--squash=title[:]] branchname
+</pre>
+
+This command internally performs the following steps:
+
+* Determines the set of files that you've changed and locks them in VSS (i.e. does a check out).
+* Performs fetch & rebase (skipped if fast-forward to base and all files already checked out).
+* Commits your changes one by one to VSS.
+* Pushes your branch to the base repository and records it as the new head.
+* Removes locks created by the first step.
+
+If the squash flag is used, the command commits all your changes to VSS at once. However, on the git side it uses merge instead of rebase, so the base repository contains full history. If the title is terminated with a colon, the VSS commit comments also include the messages from all the merged Git commits.
+
+It is possible to invoke only the first two, or the last step using:
+
+<pre>
+git vss --checkout branchname
+git vss --undo-checkouts [branchname]
+</pre>
+
+The set of current check-outs is maintained in .git/vss-checkouts, so it is easy to undo them even if the script crashes.
+
+The commit code can handle adding and changing files. Deletion wasn't implemented due to lack of need (it is also arguably more dangerous in case of a bug).
+
+h2. Pinned branches
+
+Some projects may use pinned branches, i.e. a repository structure where the same file objects are shared between two or more congruent folder trees in the repository. One of them is designated as a scratch area, and others use the pin feature of VSS to control change propagation.
+
+Git doesn't have share and pin, so such semi-branches must be promoted to full independence. This script has some features that facilitates working with them.
+
+h3. Initialization
+
+Pinned branches are initialized by passing a master option to the init subcommand:
+
+<pre>
+git vss --init --master=dev release \\SERVER\Vss Log\Log.txt 12345 < release-map.txt
+</pre>
+
+This configures @release@ as a pinned branch based on the @dev@ Git branch, which must be already initialized as an ordinary branch.
+
+h3. Repinning commits
+
+The script can be instructed to update the pin structure of a pinned branch so that it includes contents of a certain Git commit on the scratch branch. The commit must be known to git-vss, i.e. either created by its VSS->Git import code, or uploaded to VSS through it.
+
+<pre>
+git vss --repin release dev~20 dev~13 3ca8d ...
+</pre>
+
+Since the files in the pinned branch share their linear per-file history with the scratch branch, it may be impossible to repin a certain change without bringing in some other modifications done previously to the same file. The script detects such cases and aborts operation; the error message lists the problematic files, and the conflicting Git commits if known.
+
+h3. Committing to a pinned branch
+
+The commit subcommand can commit changes directly to a pinned branch. Under the hood it is done by committing to scratch and repinning, so the same ordering conflicts may occur. They are appropriately detected and reported.
+
+There is a slight difference to a manual commit to scratch & repin in that your git commits are pushed to the pinned branch in the base repo, and scratch is updated via VSS->Git import, instead of the other way round.
+
+h2. Miscellaneous
+
+h3. Merge tool
+
+If a conflict is detected by the commit subcommand, the script invokes @git mergetool@ and waits for the conflicts to be resolved before committing. It is possible to specify a different command this way:
+
+<pre>
+git vss --commit --mergetool="git gui citool --nocommit" ...
+</pre>
+
+Note that the base repository remains locked until the tool returns, so unless the conflicts are trivial and quick to resolve, or you are the only user, it may be better to abort the tool and retry committing after resolving the conflicts. The script supports this by explicitly verifying that no conflicts are left in the index after the tool invocation.
+
+h3. PostgreSQL support
+
+The script uses an SQLite database to keep its configuration and other global state. In addition, exclusive database transactions are used to synchronize access to the base repository.
+
+It is possible to replace SQLite with a PostgreSQL database. In order to do this you have to create a file called @gitvss.pg_ini@ in the root of the bare repository before running the init commands. The first line must contain a DBI connection string; the rest can contain additional SQL statements to be executed immediately after connecting:
+
+<pre>
+dbname=gitvss;host=pgserver;username=gitvss_user;password=gitvss_pwd
+SET search_path = gitvss, public
+</pre>
+
+h3. File name normalization
+
+As mentioned above, at the time when this script was created Git had issues with filename case on case-insensitive systems. One of them was that switching between branches that both had the same file, but stored its name with different case, could fail. To work around it, this script can enforce common capitalization for file names. For an example see the included pre-commit hook script.
+
+This work-around may be obsolete. It is also not very useful unless the same canonification has been applied to the imported history.
+
+h3. Summary
+
+<pre>
+Usage: git-vss [-h|--help] [--root=GIT_repository] parameters...
+ 
+Update Git from VSS:
+[--new-head] [--checkout] [--rebase] branchname
+Commit changes from Git into VSS:
+--commit [--squash=title[:]] [--mergetool=cmd] branchname
+Undo previous checkouts:
+--undo-checkouts [branchname]
+Repin commits to the specified branch:
+--repin branchname commit commit...
+ 
+Initialize repository:
+--connect base_path
+(--init|--import=path) [--no-mappings] [--no-fetch] [--master=branch]
+branchname vss_repo log_path log_offset < mappings
+(--load|--dump) [--authors=file] [--filenames=file]
+ 
+Canonify newly-added file names in the index:
+--sanitize-adds
+</pre>

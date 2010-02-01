@@ -42,7 +42,7 @@ Usage: git-vss [-h|--help] [--root=GIT_repository] parameters...
        [--new-head] [--checkout] [--rebase] branchname
     
     Commit changes from Git into VSS:
-       --commit [--squash=title[:]] branchname
+       --commit [--squash=title[:]] [--mergetool=cmd] branchname
     
     Undo previous checkouts:
        --undo-checkouts [branchname]
@@ -52,8 +52,8 @@ Usage: git-vss [-h|--help] [--root=GIT_repository] parameters...
 
     Initialize repository:
        --connect base_path
-       (--init|--import=path) [--no-mappings] [--no-fetch]
-           branchname vss_repo log_path log_offset < mappings
+       (--init|--import=path) [--no-mappings] [--no-fetch] [--master=branch]
+           branchname vss_repo log_path log_offset < mappings.txt
        (--load|--dump) [--authors=file] [--filenames=file]
 
     Canonify newly-added file names in the index:
